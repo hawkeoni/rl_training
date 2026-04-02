@@ -1,3 +1,6 @@
+import argparse
+from collections import deque
+
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 
@@ -5,8 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
-
-from collections import deque
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Trajectory:
@@ -53,24 +55,34 @@ def calculate_trajectories(actor, env, n) -> list[Trajectory]:
     return trajectories
         
 
-def reinforce(net, optimizer, observations, actions, rewards, lengths, gamma=0.99):
+def reinforce(net, optimizer, observations, actions, rewards, lengths, critic=None, critic_optimizer=None, gamma=0.99):
     with torch.no_grad():
         G = torch.zeros_like(rewards)
         running_return = torch.zeros(G.size(0))
         for i in range(G.size(1) - 1, -1, -1):
             running_return = rewards[:, i] + running_return * gamma
             G[:, i] = running_return
+
+    mask = torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+
+    critic_loss = torch.tensor(0.0)
+    if critic is not None:
+        V = critic(observations).squeeze(-1)
+        critic_loss = ((V - G.detach()).pow(2) * mask).sum()
+        advantage = (G - V.detach())
+    else:
+        advantage = G
+
     probs = torch.log_softmax(net(observations), dim=-1)
     action_probs = torch.gather(probs, 2, actions.unsqueeze(2)).squeeze(2)
-    # action probs [num_trajectories, num_steps]
-    # G - [num_trajectories, num_steps]
-    # lengths - [num_trajectories]
-    mask = torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
-    J = - (G * mask * action_probs).sum()
+    J = -(advantage * mask * action_probs).sum() + critic_loss
     J.backward()
     optimizer.step()
     optimizer.zero_grad()
-    return rewards.sum(dim=-1).mean()
+    if critic_optimizer is not None:
+        critic_optimizer.step()
+        critic_optimizer.zero_grad()
+    return rewards.sum(dim=-1).mean(), critic_loss
 
 
 
@@ -88,6 +100,19 @@ def record_video(net, env_id="CartPole-v1"):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-name", type=str, default="reinforce")
+    parser.add_argument("--use-baseline", action="store_true")
+    args = parser.parse_args()
+
+    critic = None
+    critic_optimizer = None
+    if args.use_baseline:
+        critic = nn.Linear(4, 1)
+        critic_optimizer = optim.Adam(critic.parameters(), lr=1e-2)
+    
+
+    writer = SummaryWriter(log_dir=f"runs/{args.run_name}")
     env = gym.make("CartPole-v1", render_mode="rgb_array")
     net = nn.Linear(4, 2)
     optimizer = optim.Adam(net.parameters(), lr=0.01)
@@ -95,14 +120,19 @@ def main():
 
     for i in range(1000):
         trajectories = calculate_trajectories(net, env, 50)
-        avg_reward = reinforce(net, optimizer, *merge_trajectories(trajectories))
+        avg_reward, critic_loss = reinforce(net, optimizer, *merge_trajectories(trajectories), critic=critic, critic_optimizer=critic_optimizer)
         recent_rewards.append(avg_reward.item())
         running_avg = sum(recent_rewards) / len(recent_rewards)
+        writer.add_scalar("avg_reward", avg_reward.item(), i)
+        writer.add_scalar("critic_loss", critic_loss.item() if critic is not None else 0, i)
+        writer.add_scalar("running_avg", running_avg, i)
         print(f"{i} avg_reward={avg_reward:.1f} running_avg={running_avg:.1f}")
         if len(recent_rewards) == 4 and running_avg >= 450:
             print("Solved! Recording video...")
             record_video(net)
             break
+
+    writer.close()
 
 
 
