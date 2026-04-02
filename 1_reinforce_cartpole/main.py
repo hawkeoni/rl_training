@@ -36,7 +36,7 @@ def merge_trajectories(trajectories: list[Trajectory]):
 @torch.no_grad()
 def calculate_trajectories(actor, env, n) -> list[Trajectory]:
     trajectories = []
-    for _ in tqdm(range(n)):
+    for _ in range(n):
         trajectory = Trajectory()
         obs, info = env.reset()
         terminated = False
@@ -56,12 +56,12 @@ def calculate_trajectories(actor, env, n) -> list[Trajectory]:
 def reinforce(net, optimizer, observations, actions, rewards, lengths, gamma=0.99):
     with torch.no_grad():
         G = torch.zeros_like(rewards)
-        running_return = 0
-        for i in range(G.size(0) - 1, -1, -1):
-            running_return = rewards[i] + running_return * gamma
-            G[i] = running_return
-    probs = torch.log_softmax(net(observations), dim=1)
-    action_probs = torch.gather(probs, 1, actions.unsqueeze(2)).squeeze(2)
+        running_return = torch.zeros(G.size(0))
+        for i in range(G.size(1) - 1, -1, -1):
+            running_return = rewards[:, i] + running_return * gamma
+            G[:, i] = running_return
+    probs = torch.log_softmax(net(observations), dim=-1)
+    action_probs = torch.gather(probs, 2, actions.unsqueeze(2)).squeeze(2)
     # action probs [num_trajectories, num_steps]
     # G - [num_trajectories, num_steps]
     # lengths - [num_trajectories]
@@ -69,15 +69,16 @@ def reinforce(net, optimizer, observations, actions, rewards, lengths, gamma=0.9
     J = - (G * mask * action_probs).sum()
     J.backward()
     optimizer.step()
+    optimizer.zero_grad()
     return rewards.sum(dim=-1).mean()
 
 
 
 def main():
     env = gym.make("CartPole-v1", render_mode="rgb_array")
-    env = RecordVideo(env, video_folder="videos", episode_trigger=lambda ep: True)
+    # env = RecordVideo(env, video_folder="videos", episode_trigger=lambda ep: True)
     net = nn.Linear(4, 2)
-    optimizer = optim.Adam(net.parameters(), lr=0.01)
+    optimizer = optim.Adam(net.parameters(), lr=0.001)
 
     for i in range(1000):
         trajectories = calculate_trajectories(net, env, 50)
