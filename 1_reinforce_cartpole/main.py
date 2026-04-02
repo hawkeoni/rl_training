@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
 
-from tqdm import tqdm
+from collections import deque
 
 
 class Trajectory:
@@ -74,15 +74,35 @@ def reinforce(net, optimizer, observations, actions, rewards, lengths, gamma=0.9
 
 
 
+def record_video(net, env_id="CartPole-v1"):
+    env = gym.make(env_id, render_mode="rgb_array")
+    env = RecordVideo(env, video_folder="videos", episode_trigger=lambda ep: True)
+    obs, _ = env.reset()
+    terminated, truncated = False, False
+    while not terminated and not truncated:
+        obs_t = torch.from_numpy(obs)
+        logits = net(obs_t.unsqueeze(0)).squeeze(0)
+        action = torch.argmax(logits).item()
+        obs, _, terminated, truncated, _ = env.step(action)
+    env.close()
+
+
 def main():
     env = gym.make("CartPole-v1", render_mode="rgb_array")
-    # env = RecordVideo(env, video_folder="videos", episode_trigger=lambda ep: True)
     net = nn.Linear(4, 2)
-    optimizer = optim.Adam(net.parameters(), lr=0.001)
+    optimizer = optim.Adam(net.parameters(), lr=0.01)
+    recent_rewards = deque(maxlen=4)
 
     for i in range(1000):
         trajectories = calculate_trajectories(net, env, 50)
-        print(i, reinforce(net, optimizer, *merge_trajectories(trajectories)))
+        avg_reward = reinforce(net, optimizer, *merge_trajectories(trajectories))
+        recent_rewards.append(avg_reward.item())
+        running_avg = sum(recent_rewards) / len(recent_rewards)
+        print(f"{i} avg_reward={avg_reward:.1f} running_avg={running_avg:.1f}")
+        if len(recent_rewards) == 4 and running_avg >= 450:
+            print("Solved! Recording video...")
+            record_video(net)
+            break
 
 
 
