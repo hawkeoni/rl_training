@@ -6,6 +6,7 @@ from gymnasium.wrappers import RecordVideo
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.tensorboard import SummaryWriter
@@ -29,7 +30,7 @@ def merge_trajectories(trajectories: list[Trajectory]):
     observations = pad_sequence(observations, batch_first=True, padding_value=0)
     actions = [torch.tensor(t.actions) for t in trajectories]
     actions = pad_sequence(actions, batch_first=True, padding_value=0)
-    rewards = [torch.tensor(t.rewards) for t in trajectories]
+    rewards = [torch.tensor(t.rewards, dtype=torch.float32) for t in trajectories]
     rewards = pad_sequence(rewards, batch_first=True, padding_value=0.0)
     return observations, actions, rewards, lengths
 
@@ -54,8 +55,10 @@ def calculate_trajectories(actor, env, n) -> list[Trajectory]:
         trajectories.append(trajectory)
     return trajectories
         
+@torch.no_grad()
 def generalized_advantage_estimation(rewards, values, mask, gamma=0.99, lambda_=0.98):
     # rewards - [num_trajectories, num_steps]
+    values = torch.cat([values, torch.zeros(values.size(0), 1)], dim=1)
     # values - [num_trajectories, num_steps + 1]
     gae = torch.zeros_like(rewards)
     deltas = rewards + gamma * values[:, 1:] - values[:, :-1]
@@ -67,36 +70,71 @@ def generalized_advantage_estimation(rewards, values, mask, gamma=0.99, lambda_=
     # gae - [num_trajectories, num_steps]
     return gae
 
+@torch.no_grad()
+def calculate_returns(rewards, gamma):
+    G = torch.zeros_like(rewards)
+    running_return = torch.zeros(G.size(0))
+    for i in range(G.size(1) - 1, -1, -1):
+        running_return = rewards[:, i] + running_return * gamma
+        G[:, i] = running_return
+    return G
 
 
 
-def ppo(net, optimizer, observations, actions, rewards, lengths, critic=None, critic_optimizer=None, gamma=0.99):
+def ppo(actor, actor_optimizer, observations, actions, rewards, lengths, critic, critic_optimizer, gamma=0.99):
     mask = torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
     values = critic(observations).squeeze(-1)
-    values = torch.cat([values, torch.zeros(values.size(0), 1)], dim=1)  # [n_trajectories, T+1]
-    advantage = generalized_advantage_estimation(rewards, values, mask, gamma=0.98)
+    advantage = generalized_advantage_estimation(rewards, values, mask, gamma=gamma, lambda_=0.95)
+    G = calculate_returns(rewards, gamma)
     with torch.no_grad():
-        G = torch.zeros_like(rewards)
-        running_return = torch.zeros(G.size(0))
-        for i in range(G.size(1) - 1, -1, -1):
-            running_return = rewards[:, i] + running_return * gamma
-            G[:, i] = running_return
+        old_log_probs = torch.log_softmax(actor(observations), dim=-1)
+
+    # mask, rewards, values, advantage [num_trajectories, num_steps]
+    # Flatten and keep only valid steps
+    valid = mask.flatten()
+    obs_flat = observations.flatten(0, 1)[valid]        # [num_valid_steps, obs_dim]
+    actions_flat = actions.flatten()[valid]               # [num_valid_steps]
+    advantages_flat = advantage.flatten()[valid]          # [num_valid_steps]
+    advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8)
+    returns_flat = G.flatten()[valid]                # [num_valid_steps]
+    old_log_probs_flat = old_log_probs.flatten(0, 1)[valid]   # [num_valid_steps, num_actions]
 
 
-    critic_loss = torch.tensor(0.0)
-    V = critic(observations).squeeze(-1)
-    critic_loss = ((V - G.detach()).pow(2) * mask).sum()
-    probs = torch.log_softmax(net(observations), dim=-1)
-    action_probs = torch.gather(probs, 2, actions.unsqueeze(2)).squeeze(2)
+    actor_losses, critic_losses = [], []
+    for epoch in range(4):
+        actor_losses_local, critic_losses_local = batch_train(actor, actor_optimizer, critic, critic_optimizer, obs_flat, actions_flat, returns_flat, advantages_flat, old_log_probs_flat)
+        actor_losses += actor_losses_local
+        critic_losses += critic_losses_local
+    return rewards.sum(dim=-1).mean(), actor_losses, critic_losses
+
+def batch_train(actor, actor_optimizer, critic, critic_optimizer, obs_flat, actions_flat, returns_flat, advantages_flat, old_log_probs_flat):
+    minibatch = 64
+    eps = 0.2
+    randperm = torch.randperm(obs_flat.size(0))
+    actor_losses = []
+    critic_losses = []
+    for batch_idx in range(0, obs_flat.size(0), minibatch):
+        actor_optimizer.zero_grad()
+        critic_optimizer.zero_grad()
+        idx = randperm[batch_idx: batch_idx + minibatch]
+        observations = obs_flat[idx]
+        old_log_probs  = old_log_probs_flat[idx]
+        advantage = advantages_flat[idx]
+        # advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
 
-    J = -(advantage * mask * action_probs).sum() + critic_loss
-    J.backward()
-    optimizer.step()
-    optimizer.zero_grad()
-    critic_optimizer.step()
-    critic_optimizer.zero_grad()
-    return rewards.sum(dim=-1).mean(), critic_loss
+        log_prob_diff = torch.log_softmax(actor(observations), dim=-1) - old_log_probs
+        ratio = torch.gather(torch.exp(log_prob_diff), 1, actions_flat[idx].unsqueeze(-1)).squeeze(1)
+        L = - torch.min(ratio * advantage, torch.clamp(ratio, 1 - eps, 1 + eps) * advantage).sum()
+        actor_losses.append(-L.item())
+        critic_loss = F.mse_loss(critic(observations).squeeze(-1), returns_flat[idx])
+        critic_losses.append(critic_loss.item())
+        total_loss = L + critic_loss
+
+        total_loss.backward()
+        actor_optimizer.step()
+        critic_optimizer.step()
+    return actor_losses, critic_losses
 
 
 
@@ -149,13 +187,16 @@ def main():
 
     for i in range(3000):
         trajectories = calculate_trajectories(net, env, 20)
-        avg_reward, critic_loss = ppo(net, optimizer, *merge_trajectories(trajectories), critic=critic, critic_optimizer=critic_optimizer)
+        avg_reward, actor_losses, critic_losses = ppo(net, optimizer, *merge_trajectories(trajectories), critic=critic, critic_optimizer=critic_optimizer)
         recent_rewards.append(avg_reward.item())
         running_avg = sum(recent_rewards) / len(recent_rewards)
+        avg_actor_loss = sum(actor_losses) / len(actor_losses) if actor_losses else 0
+        avg_critic_loss = sum(critic_losses) / len(critic_losses) if critic_losses else 0
         writer.add_scalar("avg_reward", avg_reward.item(), i)
-        writer.add_scalar("critic_loss", critic_loss.item() if critic is not None else 0, i)
+        writer.add_scalar("actor_loss", avg_actor_loss, i)
+        writer.add_scalar("critic_loss", avg_critic_loss, i)
         writer.add_scalar("running_avg", running_avg, i)
-        print(f"{i} avg_reward={avg_reward:.1f} running_avg={running_avg:.1f}")
+        print(f"{i} avg_reward={avg_reward:.1f} running_avg={running_avg:.1f} actor_loss={avg_actor_loss:.4f} critic_loss={avg_critic_loss:.4f}")
         if len(recent_rewards) == 10 and running_avg >= 200:
             print("Solved! Recording video...")
             record_video(net)
