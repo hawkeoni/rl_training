@@ -1,0 +1,12 @@
+{
+    "save_folder": "debug",
+    "num_epochs": 2,
+    "num_games_per_epoch": 20,
+    "num_sub_epochs": 1,
+    "num_mcts_sims": 100,
+    "learning_rate": 1e-3,
+    "batch_size": 8,
+    "c": 1.5,
+    "eval_games": 1,
+    "eval_mcts_sims": 5
+}

@@ -38,6 +38,14 @@ class AlphaZeroNet(nn.Module):
         self.value_fc1: nn.Linear = nn.Linear(ROWS * COLS, 64)
         self.value_fc2: nn.Linear = nn.Linear(64, 1)
 
+    def forward_policy(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        x = self.res_blocks(x)
+        # Policy
+        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        p = p.view(p.size(0), -1)
+        return self.policy_fc(p)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = F.relu(self.bn_in(self.conv_in(x)))
         x = self.res_blocks(x)
