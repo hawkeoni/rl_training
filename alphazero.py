@@ -50,10 +50,12 @@ class Config(BaseModel):
     # Evaluation
     eval_interval: int = 5              # Evaluate every N iterations
     eval_games: int = 40                # Games per evaluation
+    eval_random_opening: int = 4        # Random opening plies per eval game (diversifies openings)
 
     # Checkpointing / misc
     save_dir: str = "checkpoints"       # Directory for checkpoints and logs
     save_interval: int = 5              # Checkpoint every N iterations
+    autoresume: bool = True             # Resume from the latest checkpoint in save_dir if one exists
     seed: int = 0                       # Random seed
     device: str = Field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
@@ -313,6 +315,14 @@ def train_step(network: AlphaZeroNet, optimizer: torch.optim.Optimizer,
     return loss_p.item(), loss_v.item()
 
 
+def find_latest_checkpoint(save_dir: Path) -> Path | None:
+    """Return the checkpoint with the highest iteration in save_dir, or None."""
+    ckpts = list(save_dir.glob("checkpoint_iter_*.pt"))
+    if not ckpts:
+        return None
+    return max(ckpts, key=lambda p: int(p.stem.split("_")[-1]))
+
+
 def train(config: Config) -> None:
     """Outer loop: repeatedly self-play to fill a replay buffer, train on samples
     from it, checkpoint, and periodically evaluate vs the previous snapshot and vs
@@ -336,8 +346,23 @@ def train(config: Config) -> None:
     replay_buffer: deque = deque(maxlen=config.replay_buffer_size)
     prev_network: AlphaZeroNet | None = None  # snapshot from the last eval, for "vs previous"
     global_step = 0
+    start_iteration = 1
 
-    for iteration in range(1, config.iterations + 1):
+    # ---- Auto-resume from the latest checkpoint (+ replay buffer) in save_dir ----
+    latest = find_latest_checkpoint(save_dir) if config.autoresume else None
+    if latest is not None:
+        ckpt = torch.load(latest, map_location=device, weights_only=False)
+        network.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_iteration = ckpt["iteration"] + 1
+        global_step = ckpt["iteration"] * config.train_steps_per_iter  # keep TB x-axis continuous
+        buf_path = save_dir / "replay_buffer.pt"
+        if buf_path.exists():
+            replay_buffer = deque(torch.load(buf_path, weights_only=False), maxlen=config.replay_buffer_size)
+        print(f"Resumed from {latest} (iteration {ckpt['iteration']}) | "
+              f"buffer {len(replay_buffer)} | continuing at iteration {start_iteration}")
+
+    for iteration in range(start_iteration, config.iterations + 1):
         print(f"=== Iteration {iteration}/{config.iterations} ===")
 
         # ---- Self-play ----
@@ -381,12 +406,14 @@ def train(config: Config) -> None:
 
         # ---- Evaluation ----
         if iteration % config.eval_interval == 0:
-            wr_random, rec_random = evaluate(network, None, config.eval_games, config.num_sims, config.c)
+            wr_random, rec_random = evaluate(network, None, config.eval_games, config.num_sims, config.c,
+                                             config.eval_random_opening)
             writer.add_scalar("eval/winrate_vs_random", wr_random, iteration)
             print(f"  vs random:   {wr_random:.1%}  (W/D/L {rec_random[0]}/{rec_random[1]}/{rec_random[2]})")
 
             if prev_network is not None:
-                wr_prev, rec_prev = evaluate(network, prev_network, config.eval_games, config.num_sims, config.c)
+                wr_prev, rec_prev = evaluate(network, prev_network, config.eval_games, config.num_sims, config.c,
+                                             config.eval_random_opening)
                 writer.add_scalar("eval/winrate_vs_previous", wr_prev, iteration)
                 print(f"  vs previous: {wr_prev:.1%}  (W/D/L {rec_prev[0]}/{rec_prev[1]}/{rec_prev[2]})")
 
@@ -404,7 +431,9 @@ def train(config: Config) -> None:
                 "iteration": iteration,
                 "config": config.model_dump(),
             }, ckpt_path)
-            print(f"  saved {ckpt_path}")
+            # Dump the replay buffer (single rolling file, synced to the latest checkpoint).
+            torch.save(list(replay_buffer), save_dir / "replay_buffer.pt")
+            print(f"  saved {ckpt_path} (+ replay_buffer.pt, {len(replay_buffer)} elems)")
 
     writer.close()
 
@@ -424,13 +453,21 @@ def mcts_best_move(game: ConnectFour, network: AlphaZeroNet, num_sims: int, c: f
 
 @torch.no_grad()
 def play_eval_game(network: AlphaZeroNet, opponent: AlphaZeroNet | None,
-                   num_sims: int, c: float, network_plays_x: bool) -> int:
+                   num_sims: int, c: float, network_plays_x: bool,
+                   num_random_opening: int = 0) -> int:
     """Play one game. `opponent=None` means a uniform-random opponent.
+    The first `num_random_opening` plies are uniform-random for BOTH sides, so each
+    eval game starts from a distinct opening — otherwise deterministic greedy play
+    makes every same-colored game identical (a 2-game match in disguise).
     Returns the result from the network's perspective: +1 win, -1 loss, 0 draw."""
     game = ConnectFour()
     network_side = "x" if network_plays_x else "o"
+    ply = 0
     while not game.is_terminal():
-        if game.turn == network_side:
+        if ply < num_random_opening:
+            legal = game.legal_moves()
+            move = legal[np.random.randint(len(legal))]
+        elif game.turn == network_side:
             move = mcts_best_move(game, network, num_sims, c)
         elif opponent is None:
             legal = game.legal_moves()
@@ -438,14 +475,18 @@ def play_eval_game(network: AlphaZeroNet, opponent: AlphaZeroNet | None,
         else:
             move = mcts_best_move(game, opponent, num_sims, c)
         game = game.make_move(move)
+        ply += 1
     result = game.result()  # +1 x, -1 o, 0 draw
     return result if network_side == "x" else -result
 
 
 def evaluate(network: AlphaZeroNet, opponent: AlphaZeroNet | None,
-             num_games: int, num_sims: int, c: float) -> tuple[float, tuple[int, int, int]]:
+             num_games: int, num_sims: int, c: float,
+             num_random_opening: int = 0) -> tuple[float, tuple[int, int, int]]:
     """Play `network` vs `opponent` (None = random), alternating who starts.
-    Returns (score, (wins, draws, losses)) where score = (wins + 0.5*draws) / num_games."""
+    `num_random_opening` random plies diversify openings so the match isn't just
+    two deterministic games replayed. Returns (score, (wins, draws, losses))
+    where score = (wins + 0.5*draws) / num_games."""
     was_training = network.training
     network.eval()
     if opponent is not None:
@@ -453,7 +494,8 @@ def evaluate(network: AlphaZeroNet, opponent: AlphaZeroNet | None,
 
     wins = draws = losses = 0
     for i in range(num_games):
-        result = play_eval_game(network, opponent, num_sims, c, network_plays_x=(i % 2 == 0))
+        result = play_eval_game(network, opponent, num_sims, c, network_plays_x=(i % 2 == 0),
+                                num_random_opening=num_random_opening)
         if result > 0:
             wins += 1
         elif result == 0:
