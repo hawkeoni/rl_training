@@ -1,3 +1,5 @@
+import argparse
+
 import numpy as np
 
 ROWS = 6
@@ -151,24 +153,35 @@ def find_child(node: Node, action: int):
     return None
 
 
-def main():
+def random_move(game: ConnectFour) -> int:
+    legal = game.legal_moves()
+    return legal[np.random.randint(len(legal))]
+
+
+def play_game(iters: int, c: float, mcts_side: str, human_side: str = None, verbose: bool = True) -> int:
+    """Play one game. The MCTS agent plays `mcts_side`; the other side is a human
+    (if `human_side` is set) or a random opponent. Returns +1 (x wins), -1 (o wins), 0 (draw)."""
     game = ConnectFour()
-    mcts = MCTS(c=2.0)
-    human_side = input("Play as x or o? ").strip().lower()
-    assert human_side in ("x", "o")
+    mcts = MCTS(c=c, root=Node(game))
 
     while not game.is_terminal():
-        game.render()
-        if game.turn == human_side:
+        if verbose:
+            game.render()
+        if game.turn == mcts_side:
+            mcts.train(num_iters=iters)
+            best = mcts.best_child()
+            move = best.action
+            if verbose:
+                print(f"MCTS ({mcts_side}) plays {move}  (visits: {best.n}, value: {best.t / best.n:.3f})")
+        elif human_side is not None:
             legal = game.legal_moves()
             print(f"Legal columns (0-{COLS - 1}): {legal}")
             move = int(input("Your move: "))
             assert move in legal
         else:
-            mcts.train(num_iters=10000)
-            best = mcts.best_child()
-            move = best.action
-            print(f"MCTS plays {move}  (visits: {best.n}, value: {best.t / best.n:.3f})")
+            move = random_move(game)
+            if verbose:
+                print(f"Random ({game.turn}) plays {move}")
 
         game = game.make_move(move)
         # Reuse subtree if the child was previously explored
@@ -179,14 +192,55 @@ def main():
         else:
             mcts = MCTS(c=mcts.c, root=Node(game))
 
-    game.render()
-    result = game.result()
-    if result == 0:
-        print("Draw!")
-    elif (result == 1 and human_side == "x") or (result == -1 and human_side == "o"):
-        print("You win!")
-    else:
-        print("MCTS wins!")
+    if verbose:
+        game.render()
+    return game.result()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Play Connect Four against an MCTS agent.")
+    parser.add_argument("--iters", type=int, default=10000, help="MCTS iterations per move")
+    parser.add_argument("--c", type=float, default=2.0, help="UCB1 exploration constant")
+    parser.add_argument("--opponent", choices=["human", "random"], default="human",
+                        help="Who plays against the MCTS agent")
+    parser.add_argument("--games", type=int, default=1,
+                        help="Number of games to play (random opponent only)")
+    parser.add_argument("--mcts-side", choices=["x", "o"], default=None,
+                        help="Side the MCTS agent plays vs a random opponent (default: alternate each game)")
+    args = parser.parse_args()
+
+    if args.opponent == "human":
+        human_side = input("Play as x or o? ").strip().lower()
+        assert human_side in ("x", "o")
+        mcts_side = "o" if human_side == "x" else "x"
+        result = play_game(args.iters, args.c, mcts_side, human_side=human_side, verbose=True)
+        if result == 0:
+            print("Draw!")
+        elif (result == 1 and human_side == "x") or (result == -1 and human_side == "o"):
+            print("You win!")
+        else:
+            print("MCTS wins!")
+        return
+
+    # Random opponent (possibly many games)
+    wins = draws = losses = 0
+    for i in range(args.games):
+        mcts_side = args.mcts_side if args.mcts_side is not None else ("x" if i % 2 == 0 else "o")
+        verbose = args.games == 1
+        result = play_game(args.iters, args.c, mcts_side, human_side=None, verbose=verbose)
+        mcts_won = (result == 1 and mcts_side == "x") or (result == -1 and mcts_side == "o")
+        if result == 0:
+            draws += 1
+            outcome = "draw"
+        elif mcts_won:
+            wins += 1
+            outcome = "MCTS win"
+        else:
+            losses += 1
+            outcome = "MCTS loss"
+        print(f"Game {i + 1}/{args.games}: {outcome}  (MCTS={mcts_side})")
+
+    print(f"\nMCTS vs random over {args.games} games: {wins}W {draws}D {losses}L")
 
 
 if __name__ == "__main__":
