@@ -1,3 +1,5 @@
+"""Connect Four game environment, shared by the plain-MCTS and AlphaZero agents."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -22,10 +24,14 @@ class ConnectFour:
         return ConnectFour(self.state.copy(), self.turn)
 
     def legal_moves(self) -> list[int]:
+        # A column is legal if the top row is empty
         return [c for c in range(COLS) if self.state[0, c] == 0]
+    def illegal_moves(self) -> list[int]:
+        return [c for c in range(COLS) if self.state[0, c] != 0]
 
     def make_move(self, action: int) -> ConnectFour:
         state = self.state.copy()
+        # Drop piece into the lowest empty row of the column
         for row in range(ROWS - 1, -1, -1):
             if state[row, action] == 0:
                 state[row, action] = 1 if self.turn == "x" else -1
@@ -40,31 +46,42 @@ class ConnectFour:
 
     def result(self) -> int:
         # +1 for x, -1 for o, 0 for draw / ongoing
+        # Horizontal
         for r in range(ROWS):
             for c in range(COLS - CONNECT + 1):
-                window = self.state[r, c:c + CONNECT]
-                s = int(np.sum(window))
+                s = int(np.sum(self.state[r, c:c + CONNECT]))
                 if abs(s) == CONNECT:
                     return int(np.sign(s))
+        # Vertical
         for r in range(ROWS - CONNECT + 1):
             for c in range(COLS):
-                window = self.state[r:r + CONNECT, c]
-                s = int(np.sum(window))
+                s = int(np.sum(self.state[r:r + CONNECT, c]))
                 if abs(s) == CONNECT:
                     return int(np.sign(s))
+        # Diagonal (top-left to bottom-right)
         for r in range(ROWS - CONNECT + 1):
             for c in range(COLS - CONNECT + 1):
-                window = np.array([self.state[r + i, c + i] for i in range(CONNECT)])
-                s = int(np.sum(window))
+                s = int(np.sum([self.state[r + i, c + i] for i in range(CONNECT)]))
                 if abs(s) == CONNECT:
                     return int(np.sign(s))
+        # Anti-diagonal (bottom-left to top-right)
         for r in range(CONNECT - 1, ROWS):
             for c in range(COLS - CONNECT + 1):
-                window = np.array([self.state[r - i, c + i] for i in range(CONNECT)])
-                s = int(np.sum(window))
+                s = int(np.sum([self.state[r - i, c + i] for i in range(CONNECT)]))
                 if abs(s) == CONNECT:
                     return int(np.sign(s))
         return 0
+
+    def to_tensor(self) -> torch.Tensor:
+        """Encode the board from the side-to-move's perspective as a (2, ROWS, COLS)
+        float tensor: plane 0 = current player's pieces, plane 1 = opponent's."""
+        if self.turn == "x":
+            current = (self.state == 1).astype(np.float32)
+            opponent = (self.state == -1).astype(np.float32)
+        else:
+            current = (self.state == -1).astype(np.float32)
+            opponent = (self.state == 1).astype(np.float32)
+        return torch.tensor(np.stack([current, opponent], axis=0)).unsqueeze(0)
 
     def render(self) -> None:
         symbols: dict[int, str] = {0: ".", 1: "X", -1: "O"}
@@ -72,15 +89,6 @@ class ConnectFour:
         for r in range(ROWS):
             print(" ".join(symbols[int(self.state[r, c])] for c in range(COLS)))
         print()
-
-    def to_tensor(self) -> torch.Tensor:
-        if self.turn == "x":
-            current = (self.state == 1).astype(np.float32)
-            opponent = (self.state == -1).astype(np.float32)
-        else:
-            current = (self.state == -1).astype(np.float32)
-            opponent = (self.state == 1).astype(np.float32)
-        return torch.tensor(np.stack([current, opponent], axis=0))
 
     def state_key(self) -> bytes:
         return self.state.tobytes()
