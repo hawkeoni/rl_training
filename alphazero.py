@@ -209,7 +209,7 @@ def mcts(root: Node, network: AlphaZeroNet, num_sims: int, c: float,
     If `dirichlet_eps > 0`, Dirichlet noise is mixed into the root's child priors
     (once, when the root is first expanded) to encourage exploration in self-play.
     Evaluation should leave `dirichlet_eps=0` for deterministic strongest play."""
-
+    device = next(network.parameters()).device
 
     for _ in range(num_sims):
         node = root
@@ -224,11 +224,14 @@ def mcts(root: Node, network: AlphaZeroNet, num_sims: int, c: float,
             node.t += z
             node.n += 1
         else:
-            p_logits, v = network(node.game.to_tensor())
-            illegal_moves = node.game.illegal_moves()
+            # Inside this block every tensor factory (to_tensor, the mask index, ...)
+            # is created on `device` automatically — no manual .to() needed.
+            with torch.device(device):
+                p_logits, v = network(node.game.to_tensor())
+                illegal_moves = node.game.illegal_moves()
+                p_logits = p_logits.index_fill(1, torch.tensor(illegal_moves, dtype=torch.long), -1e6)
+                p_probs = torch.softmax(p_logits, dim=1)
             legal_moves = node.game.legal_moves()
-            p_logits = p_logits.index_fill(1, torch.LongTensor(illegal_moves), -1e6)
-            p_probs = torch.softmax(p_logits, dim=1)
             for move in legal_moves:
                 node.children[move] = Node(node.game.make_move(move), node, move, p_probs[0, move].item())
             z = v.item()
@@ -301,9 +304,13 @@ def train_step(network: AlphaZeroNet, optimizer: torch.optim.Optimizer,
     """One gradient step on a batch of (state, policy_target, z).
     Loss = cross-entropy(policy_logits, policy_target) + MSE(value, z).
     Returns (policy_loss, value_loss) as floats."""
-    x = torch.cat([b.state for b in batch], dim=0)
-    y_p = torch.vstack([torch.Tensor(b.move_probs) for b in batch])
-    y_v = torch.tensor([b.z for b in batch], dtype=torch.float32)
+    # The replay buffer holds CPU tensors; move each assembled batch to the net's
+    # device. (A torch.device() context wouldn't help here: cat/vstack over existing
+    # CPU tensors keep their device — only tensor *factories* honor the context.)
+    device = next(network.parameters()).device
+    x = torch.cat([b.state for b in batch], dim=0).to(device)
+    y_p = torch.vstack([torch.Tensor(b.move_probs) for b in batch]).to(device)
+    y_v = torch.tensor([b.z for b in batch], dtype=torch.float32).to(device)
     p, v = network(x)
     v = v.squeeze(1)
     loss_p = F.cross_entropy(p, y_p)
