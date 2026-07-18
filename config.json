@@ -1,21 +1,27 @@
 {
-  "num_sims": 200,
+  "num_sims": 500,
   "c": 1.5,
   "dirichlet_alpha": 1.0,
   "dirichlet_eps": 0.25,
+  "temp_move_threshold": 8,
+
   "channels": 64,
   "res_blocks": 5,
-  "iterations": 100,
+
+  "iterations": 60,
   "games_per_iter": 100,
   "train_steps_per_iter": 1000,
   "batch_size": 128,
   "lr": 0.001,
   "weight_decay": 0.0001,
   "replay_buffer_size": 100000,
+
   "eval_interval": 5,
   "eval_games": 40,
-  "save_dir": "checkpoints",
+  "eval_random_opening": 4,
+
+  "save_dir": "checkpoints_scaled",
   "save_interval": 5,
-  "seed": 0,
-  "temp_move_threshold": 8
+  "autoresume": true,
+  "seed": 0
 }

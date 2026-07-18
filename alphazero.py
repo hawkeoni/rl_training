@@ -369,7 +369,7 @@ def train(config: Config) -> None:
         network.eval()
         t0 = time.time()
         new_examples = 0
-        for _ in tqdm(range(config.games_per_iter)):
+        for _ in tqdm(range(config.games_per_iter), desc="Self-play"):
             examples = self_play(network, config.num_sims, config.c, config.temp_move_threshold,
                                  config.dirichlet_alpha, config.dirichlet_eps)
             replay_buffer.extend(examples)
@@ -385,7 +385,7 @@ def train(config: Config) -> None:
         policy_sum = value_sum = 0.0
         steps = 0
         if len(replay_buffer) >= config.batch_size:
-            for _ in range(config.train_steps_per_iter):
+            for _ in tqdm(range(config.train_steps_per_iter), desc="Train"):
                 batch = random.sample(replay_buffer, config.batch_size)
                 policy_loss, value_loss = train_step(network, optimizer, batch)
                 writer.add_scalar("loss/policy", policy_loss, global_step)
